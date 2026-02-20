@@ -108,7 +108,11 @@ export default function YoutubeDownloader() {
       const data = await res.json();
 
       if (!res.ok || data.error) {
-        throw new Error(data.error || "Download failed.");
+        const err = data.error || "Download failed.";
+        if (data.rapidApiUrl) {
+          window.open(data.rapidApiUrl, "_blank");
+        }
+        throw new Error(err);
       }
 
       if (data.url) {

@@ -5,7 +5,7 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
-interface RapidFormat {
+interface VideoFormat {
   url: string;
   qualityLabel?: string;
   quality?: string;
@@ -13,7 +13,52 @@ interface RapidFormat {
   hasAudio?: boolean;
   bitrate?: number;
   height?: number;
-  contentLength?: string;
+}
+
+interface NormalizedResult {
+  formats: VideoFormat[];
+}
+
+async function tryApi(
+  label: string,
+  url: string,
+  host: string,
+  apiKey: string,
+  normalize: (data: unknown) => NormalizedResult | null
+): Promise<NormalizedResult | null> {
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'X-RapidAPI-Key': apiKey,
+        'X-RapidAPI-Host': host,
+      },
+      signal: AbortSignal.timeout(20000),
+    });
+
+    console.log(`${label}: HTTP ${res.status}`);
+
+    if (res.status === 403) {
+      console.log(`${label}: Not subscribed, skipping`);
+      return null;
+    }
+    if (res.status === 429) {
+      console.log(`${label}: Rate limited`);
+      // Still return null so we try next API
+      return null;
+    }
+    if (!res.ok) {
+      const txt = await res.text();
+      console.log(`${label}: Error — ${txt.slice(0, 200)}`);
+      return null;
+    }
+
+    const data = await res.json();
+    console.log(`${label}: Got response, keys: ${Object.keys(data).join(', ')}`);
+    return normalize(data);
+  } catch (e) {
+    console.log(`${label}: Exception — ${e}`);
+    return null;
+  }
 }
 
 serve(async (req) => {
@@ -31,151 +76,122 @@ serve(async (req) => {
       );
     }
 
-    const isAudio = quality === 'audio';
-    const rapidApiKey = Deno.env.get('RAPIDAPI_KEY');
-
-    if (!rapidApiKey) {
+    const apiKey = Deno.env.get('RAPIDAPI_KEY');
+    if (!apiKey) {
       return new Response(
-        JSON.stringify({ error: 'Service not configured. Please set up a RapidAPI key.' }),
+        JSON.stringify({ error: 'Service not configured.' }),
         { status: 503, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    console.log(`Fetching streams for videoId: ${videoId}, quality: ${quality}`);
+    const isAudio = quality === 'audio';
+    let result: NormalizedResult | null = null;
 
-    const res = await fetch(
-      `https://ytstream-download-youtube-videos.p.rapidapi.com/dl?id=${videoId}`,
-      {
-        headers: {
-          'X-RapidAPI-Key': rapidApiKey,
-          'X-RapidAPI-Host': 'ytstream-download-youtube-videos.p.rapidapi.com',
-        },
-        signal: AbortSignal.timeout(20000),
+    // ── API 1: YT-API (most popular, generous free tier) ──────────────────
+    result = await tryApi(
+      'yt-api',
+      `https://yt-api.p.rapidapi.com/dl?id=${videoId}`,
+      'yt-api.p.rapidapi.com',
+      apiKey,
+      (data: unknown) => {
+        const d = data as { status?: string; formats?: VideoFormat[] };
+        if (d.status !== 'ok' || !Array.isArray(d.formats)) return null;
+        return { formats: d.formats };
       }
     );
 
-    console.log(`RapidAPI status: ${res.status}`);
+    // ── API 2: YTStream Download ──────────────────────────────────────────
+    if (!result) {
+      result = await tryApi(
+        'ytstream',
+        `https://ytstream-download-youtube-videos.p.rapidapi.com/dl?id=${videoId}`,
+        'ytstream-download-youtube-videos.p.rapidapi.com',
+        apiKey,
+        (data: unknown) => {
+          const d = data as { formats?: VideoFormat[]; adaptiveFormats?: VideoFormat[] };
+          const all = [...(d.formats || []), ...(d.adaptiveFormats || [])];
+          return all.length > 0 ? { formats: all } : null;
+        }
+      );
+    }
 
-    if (!res.ok) {
-      const body = await res.text();
-      console.log(`RapidAPI error body: ${body.slice(0, 300)}`);
-      const isRateLimit = res.status === 429;
+    // ── API 3: YouTube Video Download Info ────────────────────────────────
+    if (!result) {
+      result = await tryApi(
+        'yt-video-info',
+        `https://youtube-video-download-info.p.rapidapi.com/dl?id=${videoId}`,
+        'youtube-video-download-info.p.rapidapi.com',
+        apiKey,
+        (data: unknown) => {
+          const d = data as { status?: string; link?: Array<Array<{ url?: string; type?: string; quality?: string }>> };
+          if (d.status !== 'ok' || !Array.isArray(d.link)) return null;
+          // link is array of arrays; flatten into VideoFormat[]
+          const formats: VideoFormat[] = d.link.flat().map((l) => ({
+            url: l.url || '',
+            qualityLabel: l.quality,
+            mimeType: l.type,
+          })).filter(f => f.url);
+          return formats.length > 0 ? { formats } : null;
+        }
+      );
+    }
+
+    if (!result || result.formats.length === 0) {
       return new Response(
         JSON.stringify({
-          error: isRateLimit
-            ? 'Too many requests — please wait a moment and try again.'
-            : `Download service error (${res.status}). Please try again.`,
+          error: 'Not subscribed to any YouTube download API. Please subscribe to "YT-API" on RapidAPI (free plan available) and try again.',
+          rapidApiUrl: 'https://rapidapi.com/ytjar/api/yt-api',
         }),
-        { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        { status: 503, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    const data = await res.json();
-    console.log(`RapidAPI response keys: ${Object.keys(data).join(', ')}`);
+    const { formats } = result;
+    console.log(`Total formats: ${formats.length}`);
 
-    // ytstream returns { formats: [...], adaptiveFormats: [...] }
-    const allFormats: RapidFormat[] = [
-      ...(data.formats || []),
-      ...(data.adaptiveFormats || []),
-    ];
-
-    console.log(`Total formats: ${allFormats.length}`);
-    if (allFormats.length > 0) {
-      console.log(`Sample format: ${JSON.stringify(allFormats[0]).slice(0, 200)}`);
-    }
-
-    if (allFormats.length === 0) {
-      return new Response(
-        JSON.stringify({ error: 'No streams found for this video.' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
+    // ── Pick best format ──────────────────────────────────────────────────
     if (isAudio) {
-      // Get best audio-only stream
-      const audioStreams = allFormats
-        .filter(f => f.mimeType?.startsWith('audio/') || (f.hasAudio && !f.mimeType?.startsWith('video/')))
-        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-      // Fallback: combined streams that have audio
-      const combined = allFormats
-        .filter(f => f.mimeType?.startsWith('video/') && f.hasAudio !== false)
-        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-      const best = audioStreams[0] || combined[0];
+      const audioOnly = formats.filter(f => f.mimeType?.startsWith('audio/')).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      const combined = formats.filter(f => f.mimeType?.startsWith('video/') && f.hasAudio !== false).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      const best = audioOnly[0] || combined[0];
 
       if (!best?.url) {
-        return new Response(
-          JSON.stringify({ error: 'No audio stream found.' }),
-          { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
+        return new Response(JSON.stringify({ error: 'No audio stream found.' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
-
-      return new Response(
-        JSON.stringify({ url: best.url, mimeType: best.mimeType, type: 'audio' }),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+      return new Response(JSON.stringify({ url: best.url, mimeType: best.mimeType, type: 'audio' }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // Video — find closest quality
+    // Video
     const targetHeight = parseInt(quality);
-    const videoFormats = allFormats.filter(f => f.mimeType?.startsWith('video/'));
+    const videoFormats = formats.filter(f => f.mimeType?.startsWith('video/'));
 
-    if (videoFormats.length === 0) {
-      return new Response(
-        JSON.stringify({ error: 'No video streams found.' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Prefer combined (has audio), sorted by closeness to requested height
-    const combined = videoFormats.filter(f => f.hasAudio !== false);
-    const videoOnly = videoFormats.filter(f => f.hasAudio === false);
-
-    function closestTo(formats: RapidFormat[], target: number): RapidFormat | null {
-      if (formats.length === 0) return null;
-      return formats.sort((a, b) => {
+    function closest(list: VideoFormat[], target: number): VideoFormat | null {
+      if (!list.length) return null;
+      return list.sort((a, b) => {
         const ah = a.height || parseInt(a.qualityLabel || '0');
         const bh = b.height || parseInt(b.qualityLabel || '0');
-        // Prefer closest at or below target, then closest above
-        const adiff = Math.abs(ah - target);
-        const bdiff = Math.abs(bh - target);
-        return adiff - bdiff;
+        return Math.abs(ah - target) - Math.abs(bh - target);
       })[0];
     }
 
-    let picked = closestTo(combined, targetHeight);
+    const combined = videoFormats.filter(f => f.hasAudio !== false);
+    const videoOnly = videoFormats.filter(f => f.hasAudio === false);
+
+    let picked = closest(combined, targetHeight);
     let isVideoOnly = false;
-    if (!picked) {
-      picked = closestTo(videoOnly, targetHeight);
-      isVideoOnly = !!picked;
-    }
+    if (!picked) { picked = closest(videoOnly, targetHeight); isVideoOnly = true; }
 
     if (!picked?.url) {
-      return new Response(
-        JSON.stringify({ error: 'No suitable video stream found.' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+      return new Response(JSON.stringify({ error: 'No suitable video stream found.' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    const actualQuality = picked.qualityLabel || picked.quality || `${quality}p`;
-
     return new Response(
-      JSON.stringify({
-        url: picked.url,
-        quality: actualQuality,
-        mimeType: picked.mimeType,
-        videoOnly: isVideoOnly,
-        type: 'video',
-      }),
+      JSON.stringify({ url: picked.url, quality: picked.qualityLabel || picked.quality || `${quality}p`, mimeType: picked.mimeType, videoOnly: isVideoOnly, type: 'video' }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
 
   } catch (err) {
     console.error('Download error:', err);
-    return new Response(
-      JSON.stringify({ error: 'Internal server error' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({ error: 'Internal server error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 });
