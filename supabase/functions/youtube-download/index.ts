@@ -5,6 +5,58 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
+// Multiple Piped API instances for redundancy
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://piped-api.garudalinux.org',
+  'https://api.piped.projectsegfau.lt',
+  'https://pipedapi.tokhmi.xyz',
+];
+
+interface PipedAudioStream {
+  url: string;
+  quality: string;
+  mimeType: string;
+  bitrate: number;
+}
+
+interface PipedVideoStream {
+  url: string;
+  quality: string;
+  mimeType: string;
+  videoOnly: boolean;
+  codec?: string;
+}
+
+interface PipedResponse {
+  title?: string;
+  audioStreams: PipedAudioStream[];
+  videoStreams: PipedVideoStream[];
+}
+
+async function fetchFromPiped(videoId: string): Promise<PipedResponse | null> {
+  for (const instance of PIPED_INSTANCES) {
+    try {
+      const res = await fetch(`${instance}/streams/${videoId}`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.audioStreams || data.videoStreams) {
+          console.log(`Got streams from ${instance}`);
+          return data as PipedResponse;
+        }
+      }
+    } catch (e) {
+      console.log(`Instance ${instance} failed: ${e}`);
+    }
+  }
+  return null;
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
@@ -21,145 +73,98 @@ serve(async (req) => {
     }
 
     const isAudio = quality === 'audio';
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-    // Use yt-dlp compatible API via a reliable public endpoint
-    // We use rapidapi's YouTube download service
-    const rapidApiKey = Deno.env.get('RAPIDAPI_KEY');
+    const pipedData = await fetchFromPiped(videoId);
 
-    if (rapidApiKey) {
-      // Use RapidAPI YouTube downloader
-      const apiUrl = isAudio
-        ? `https://youtube-mp36.p.rapidapi.com/dl?id=${videoId}`
-        : `https://youtube-video-download-info.p.rapidapi.com/dl?id=${videoId}`;
+    if (!pipedData) {
+      return new Response(
+        JSON.stringify({ error: 'Could not retrieve video streams. The video may be unavailable.' }),
+        { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
 
-      const hostHeader = isAudio
-        ? 'youtube-mp36.p.rapidapi.com'
-        : 'youtube-video-download-info.p.rapidapi.com';
+    if (isAudio) {
+      // Sort audio streams by bitrate descending, prefer mp4/aac
+      const audioStreams = [...(pipedData.audioStreams || [])].sort((a, b) => b.bitrate - a.bitrate);
+      const best = audioStreams.find(s => s.mimeType?.includes('mp4') || s.mimeType?.includes('aac'))
+        || audioStreams[0];
 
-      const response = await fetch(apiUrl, {
-        headers: {
-          'X-RapidAPI-Key': rapidApiKey,
-          'X-RapidAPI-Host': hostHeader,
-        }
+      if (!best?.url) {
+        return new Response(
+          JSON.stringify({ error: 'No audio stream found for this video.' }),
+          { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ url: best.url, mimeType: best.mimeType, type: 'audio' }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // Video: first try combined streams (has audio), then video-only
+    const targetQuality = quality === '2160' ? '4K' : `${quality}p`;
+    const videoStreams = pipedData.videoStreams || [];
+
+    // Combined streams (with audio) – max 720p on YouTube
+    const combinedStreams = videoStreams.filter(s => !s.videoOnly && s.mimeType?.includes('mp4'));
+    // Video-only streams (no audio but higher quality available)
+    const videoOnlyStreams = videoStreams.filter(s => s.videoOnly && s.mimeType?.includes('mp4'));
+
+    // Helper: pick closest quality
+    const qualityOrder = ['2160p', '4K', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p'];
+    const targetIdx = qualityOrder.findIndex(q => q.toLowerCase() === targetQuality.toLowerCase());
+
+    function pickBestStream(streams: PipedVideoStream[]): PipedVideoStream | null {
+      // Exact match first
+      const exact = streams.find(s => s.quality?.toLowerCase() === targetQuality.toLowerCase());
+      if (exact) return exact;
+
+      // Sort by quality descending
+      const sorted = [...streams].sort((a, b) => {
+        const ai = qualityOrder.findIndex(q => a.quality?.toLowerCase().startsWith(q.toLowerCase().replace('4k', '2160')));
+        const bi = qualityOrder.findIndex(q => b.quality?.toLowerCase().startsWith(q.toLowerCase().replace('4k', '2160')));
+        return ai - bi;
       });
 
-      if (response.ok) {
-        const data = await response.json();
-        if (isAudio && data.link) {
-          return new Response(
-            JSON.stringify({ url: data.link, filename: `audio.mp3` }),
-            { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        } else if (!isAudio && data.formats) {
-          const qualityMap: Record<string, string[]> = {
-            '2160': ['2160p', '4K', 'uhd'],
-            '1440': ['1440p', '2K', 'qhd'],
-            '1080': ['1080p', 'fhd', '1080'],
-            '720': ['720p', 'hd', '720'],
-            '480': ['480p', 'sd', '480'],
-            '360': ['360p', '360'],
-            '240': ['240p', '240'],
-            '144': ['144p', '144'],
-          };
+      // Find the closest quality at or below target
+      const atOrBelow = sorted.filter(s => {
+        const si = qualityOrder.findIndex(q => s.quality?.toLowerCase().startsWith(q.toLowerCase().replace('4k', '2160')));
+        return si >= targetIdx;
+      });
 
-          const preferredLabels = qualityMap[quality] || ['720p'];
-          let downloadUrl: string | null = null;
-
-          for (const label of preferredLabels) {
-            const format = data.formats.find((f: { qualityLabel?: string; url?: string }) =>
-              f.qualityLabel?.toLowerCase().includes(label.toLowerCase())
-            );
-            if (format?.url) {
-              downloadUrl = format.url;
-              break;
-            }
-          }
-
-          if (!downloadUrl && data.formats.length > 0) {
-            downloadUrl = data.formats[0].url;
-          }
-
-          if (downloadUrl) {
-            return new Response(
-              JSON.stringify({ url: downloadUrl, filename: `video.mp4` }),
-              { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-            );
-          }
-        }
-      }
+      return atOrBelow[0] || sorted[0] || null;
     }
 
-    // Fallback: use y2mate-like API (no key needed)
-    const y2mateApiUrl = 'https://www.y2mate.com/mates/analyzeV2/ajax';
-    const y2mateBody = new URLSearchParams({
-      k_query: videoUrl,
-      k_page: 'home',
-      hl: 'en',
-      q_auto: '0',
-    });
+    // Try combined first (has audio)
+    let picked = pickBestStream(combinedStreams);
 
-    const y2mateRes = await fetch(y2mateApiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      },
-      body: y2mateBody.toString(),
-    });
-
-    if (y2mateRes.ok) {
-      const y2mateData = await y2mateRes.json();
-      if (y2mateData.status === 'ok' && y2mateData.links) {
-        const links = isAudio ? y2mateData.links.mp3 : y2mateData.links.mp4;
-        if (links) {
-          // Find the right quality
-          const qualityKey = isAudio ? '128' : quality;
-          const targetLink = links[qualityKey] || Object.values(links)[0] as { k?: string };
-
-          if (targetLink && typeof targetLink === 'object' && 'k' in targetLink && targetLink.k) {
-            // Convert via y2mate
-            const convertBody = new URLSearchParams({
-              type: isAudio ? 'mp3' : 'mp4',
-              _id: y2mateData.vid,
-              v_id: y2mateData.vid,
-              ajax: '1',
-              token: '',
-              ftype: isAudio ? 'mp3' : 'mp4',
-              fquality: qualityKey,
-              k: targetLink.k as string,
-            });
-
-            const convertRes = await fetch('https://www.y2mate.com/mates/convertV2/index', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              },
-              body: convertBody.toString(),
-            });
-
-            if (convertRes.ok) {
-              const convertData = await convertRes.json();
-              if (convertData.status === 'ok' && convertData.dlink) {
-                return new Response(
-                  JSON.stringify({ url: convertData.dlink }),
-                  { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-                );
-              }
-            }
-          }
-        }
-      }
+    // If combined stream quality is too low and user wants higher, try video-only
+    if (!picked || (targetIdx < qualityOrder.indexOf('720p') && videoOnlyStreams.length > 0)) {
+      const videoOnly = pickBestStream(videoOnlyStreams);
+      if (videoOnly) picked = videoOnly;
     }
 
-    // Final fallback — return a redirect URL
+    if (!picked?.url) {
+      return new Response(
+        JSON.stringify({ error: 'No video stream found for the requested quality.' }),
+        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // For video-only streams, also return the best audio stream so client can inform user
+    const audioForVideo = isAudio ? null : ([...(pipedData.audioStreams || [])].sort((a, b) => b.bitrate - a.bitrate)[0] || null);
+
     return new Response(
       JSON.stringify({
-        error: 'direct_download_unavailable',
-        fallbackUrl: `https://www.youtube.com/watch?v=${videoId}`,
+        url: picked.url,
+        quality: picked.quality,
+        mimeType: picked.mimeType,
+        videoOnly: picked.videoOnly,
+        type: 'video',
+        audioUrl: picked.videoOnly ? audioForVideo?.url : undefined,
       }),
-      { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
 
   } catch (err) {
