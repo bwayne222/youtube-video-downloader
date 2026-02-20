@@ -94,9 +94,10 @@ serve(async (req) => {
       'yt-api.p.rapidapi.com',
       apiKey,
       (data: unknown) => {
-        const d = data as { status?: string; formats?: VideoFormat[] };
-        if (d.status !== 'ok' || !Array.isArray(d.formats)) return null;
-        return { formats: d.formats };
+        const d = data as { status?: string; formats?: VideoFormat[]; adaptiveFormats?: VideoFormat[] };
+        // Accept any non-error status or just check formats exist
+        const all = [...(d.formats || []), ...(d.adaptiveFormats || [])];
+        return all.length > 0 ? { formats: all } : null;
       }
     );
 
