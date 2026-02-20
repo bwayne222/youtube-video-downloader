@@ -107,25 +107,22 @@ export default function YoutubeDownloader() {
 
       const data = await res.json();
 
-      if (res.status === 422 || data.error === "direct_download_unavailable") {
-        // Graceful fallback — open the YouTube video page
-        window.open(`https://www.youtube.com/watch?v=${videoInfo.videoId}`, "_blank");
-        setError("Direct download is not available for this video. Opened YouTube instead.");
-        return;
-      }
-
       if (!res.ok || data.error) {
         throw new Error(data.error || "Download failed.");
       }
 
       if (data.url) {
-        const a = document.createElement("a");
-        a.href = data.url;
-        a.download = isAudio ? `${videoInfo.title}.mp3` : `${videoInfo.title}.mp4`;
-        a.target = "_blank";
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        // Open the stream URL in a new tab so the browser handles the download
+        window.open(data.url, "_blank");
+
+        // If it's a video-only stream (no embedded audio), also open audio separately
+        if (data.videoOnly && data.audioUrl) {
+          setTimeout(() => {
+            window.open(data.audioUrl, "_blank");
+          }, 800);
+          setError("This quality has separate video & audio tracks — both tabs opened. Merge them with a tool like FFmpeg if needed.");
+        }
+
         setDownloadSuccess(true);
       } else {
         throw new Error("No download link received.");
