@@ -89,37 +89,38 @@ export default function YoutubeDownloader() {
 
     try {
       const isAudio = selectedQuality === "audio";
-      const cobaltUrl = "https://api.cobalt.tools/";
+      const projectId = import.meta.env.VITE_SUPABASE_PROJECT_ID;
+      const anonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+      const fnUrl = `https://${projectId}.supabase.co/functions/v1/youtube-download`;
 
-      const body: Record<string, unknown> = {
-        url: `https://www.youtube.com/watch?v=${videoInfo.videoId}`,
-        downloadMode: isAudio ? "audio" : "auto",
-        youtubeVideoCodec: "h264",
-        videoQuality: isAudio ? "max" : selectedQuality,
-        filenameStyle: "pretty",
-      };
-
-      const res = await fetch(cobaltUrl, {
+      const res = await fetch(fnUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Accept: "application/json",
+          "apikey": anonKey,
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          videoId: videoInfo.videoId,
+          quality: selectedQuality,
+        }),
       });
-
-      if (!res.ok) throw new Error("Download service unavailable.");
 
       const data = await res.json();
 
-      if (data.status === "error") {
-        throw new Error(data.error?.code || "Download failed.");
+      if (res.status === 422 || data.error === "direct_download_unavailable") {
+        // Graceful fallback — open the YouTube video page
+        window.open(`https://www.youtube.com/watch?v=${videoInfo.videoId}`, "_blank");
+        setError("Direct download is not available for this video. Opened YouTube instead.");
+        return;
       }
 
-      const downloadLink = data.url || data.tunnel;
-      if (downloadLink) {
+      if (!res.ok || data.error) {
+        throw new Error(data.error || "Download failed.");
+      }
+
+      if (data.url) {
         const a = document.createElement("a");
-        a.href = downloadLink;
+        a.href = data.url;
         a.download = isAudio ? `${videoInfo.title}.mp3` : `${videoInfo.title}.mp4`;
         a.target = "_blank";
         document.body.appendChild(a);
@@ -130,10 +131,8 @@ export default function YoutubeDownloader() {
         throw new Error("No download link received.");
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Download failed.";
-      // Fallback: open on cobalt.tools website
-      window.open(`https://cobalt.tools/?u=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoInfo.videoId}`)}`, "_blank");
-      setDownloadSuccess(true);
+      const msg = err instanceof Error ? err.message : "Download failed. Please try again.";
+      setError(msg);
     } finally {
       setDownloading(false);
     }
@@ -216,7 +215,7 @@ export default function YoutubeDownloader() {
               {downloadSuccess && (
                 <div className="flex items-center gap-2 text-accent bg-accent/10 rounded-xl px-4 py-3 mb-4 text-sm animate-bounce-in border border-accent/20">
                   <CheckCircle2 className="w-4 h-4 shrink-0" />
-                  <span>Download started! Check your downloads folder or the cobalt.tools page that opened.</span>
+                  <span>Download started! Check your downloads folder.</span>
                 </div>
               )}
 
@@ -309,7 +308,7 @@ export default function YoutubeDownloader() {
                   </button>
 
                   <p className="text-center text-xs text-muted-foreground mt-3">
-                    Powered by cobalt.tools • For personal use only
+                    For personal use only • Respect copyright laws
                   </p>
                 </div>
               )}
