@@ -166,6 +166,21 @@ serve(async (req) => {
     const targetHeight = parseInt(quality);
     const videoFormats = formats.filter(f => f.mimeType?.startsWith('video/'));
 
+    // Detect if a format has audio: check hasAudio field, or if mimeType contains "audio",
+    // or if it comes from the "formats" array (which are combined streams).
+    // adaptiveFormats video entries are typically video-only.
+    function hasAudioTrack(f: VideoFormat): boolean {
+      if (f.hasAudio === true) return true;
+      if (f.hasAudio === false) return false;
+      // If mimeType contains both video and audio codecs, it likely has audio
+      // Combined formats usually have mimeType like "video/mp4; codecs=..." with audio codec
+      // A simple heuristic: if the format has a qualityLabel AND bitrate is relatively high
+      // But the most reliable way: check if mimeType mentions audio codecs
+      const mime = f.mimeType || '';
+      if (mime.includes('mp4a') || mime.includes('opus') || mime.includes('vorbis')) return true;
+      return false;
+    }
+
     function closest(list: VideoFormat[], target: number): VideoFormat | null {
       if (!list.length) return null;
       return list.sort((a, b) => {
@@ -175,8 +190,8 @@ serve(async (req) => {
       })[0];
     }
 
-    const combined = videoFormats.filter(f => f.hasAudio !== false);
-    const videoOnly = videoFormats.filter(f => f.hasAudio === false);
+    const combined = videoFormats.filter(f => hasAudioTrack(f));
+    const videoOnly = videoFormats.filter(f => !hasAudioTrack(f));
 
     let picked = closest(combined, targetHeight);
     let isVideoOnly = false;
@@ -186,8 +201,15 @@ serve(async (req) => {
       return new Response(JSON.stringify({ error: 'No suitable video stream found.' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
+    // If video-only, also find best audio stream to send alongside
+    let audioUrl: string | undefined;
+    if (isVideoOnly) {
+      const audioStreams = formats.filter(f => f.mimeType?.startsWith('audio/')).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      audioUrl = audioStreams[0]?.url;
+    }
+
     return new Response(
-      JSON.stringify({ url: picked.url, quality: picked.qualityLabel || picked.quality || `${quality}p`, mimeType: picked.mimeType, videoOnly: isVideoOnly, type: 'video' }),
+      JSON.stringify({ url: picked.url, quality: picked.qualityLabel || picked.quality || `${quality}p`, mimeType: picked.mimeType, videoOnly: isVideoOnly, audioUrl, type: 'video' }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
 
