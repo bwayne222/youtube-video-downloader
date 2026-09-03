@@ -71,7 +71,7 @@ export default function YoutubeDownloader() {
       setVideoInfo({
         videoId,
         title: data.title,
-        thumbnail: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
+        thumbnail: data.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
         author: data.author_name,
       });
     } catch {
@@ -254,9 +254,21 @@ export default function YoutubeDownloader() {
                     <img
                       src={videoInfo.thumbnail}
                       alt={videoInfo.title}
+                      loading="lazy"
+                      referrerPolicy="no-referrer"
                       className="w-full object-cover aspect-video"
                       onError={(e) => {
-                        (e.target as HTMLImageElement).src = `https://img.youtube.com/vi/${videoInfo.videoId}/hqdefault.jpg`;
+                        const img = e.currentTarget;
+                        const chain = [
+                          `https://i.ytimg.com/vi/${videoInfo.videoId}/hqdefault.jpg`,
+                          `https://i.ytimg.com/vi/${videoInfo.videoId}/mqdefault.jpg`,
+                          `https://img.youtube.com/vi/${videoInfo.videoId}/hqdefault.jpg`,
+                          `https://i.ytimg.com/vi/${videoInfo.videoId}/default.jpg`,
+                        ];
+                        const idx = chain.indexOf(img.src);
+                        const fallback = idx === -1 ? chain[0] : chain[idx + 1];
+                        if (fallback) img.src = fallback;
+                        else img.style.display = "none";
                       }}
                     />
                     <a
