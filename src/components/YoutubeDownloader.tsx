@@ -71,7 +71,7 @@ export default function YoutubeDownloader() {
       setVideoInfo({
         videoId,
         title: data.title,
-        thumbnail: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
+        thumbnail: data.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
         author: data.author_name,
       });
     } catch {
