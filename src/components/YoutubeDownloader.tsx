@@ -83,12 +83,24 @@ export default function YoutubeDownloader() {
 
   const handleDownload = async () => {
     if (!videoInfo) return;
+
+    // Open the destination while this click is still a trusted user action.
+    // Browsers block window.open calls made after an awaited network request.
+    const downloadWindow = window.open("about:blank", "_blank");
+    const mayNeedSeparateAudio = selectedQuality !== "audio" && Number(selectedQuality) > 720;
+    const audioWindow = mayNeedSeparateAudio ? window.open("about:blank", "_blank") : null;
+
+    if (!downloadWindow) {
+      setError("Your browser blocked the download. Please allow pop-ups for this site and try again.");
+      audioWindow?.close();
+      return;
+    }
+
     setDownloading(true);
     setDownloadSuccess(false);
     setError("");
 
     try {
-      const isAudio = selectedQuality === "audio";
       const projectId = import.meta.env.VITE_SUPABASE_PROJECT_ID;
       const anonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
       const fnUrl = `https://${projectId}.supabase.co/functions/v1/youtube-download`;
@@ -116,15 +128,18 @@ export default function YoutubeDownloader() {
       }
 
       if (data.url) {
-        // Open the stream URL in a new tab so the browser handles the download
-        window.open(data.url, "_blank");
+        downloadWindow.location.replace(data.url);
 
-        // If it's a video-only stream (no embedded audio), also open audio separately
+        // YouTube serves higher resolutions as separate video and audio streams.
         if (data.videoOnly && data.audioUrl) {
-          setTimeout(() => {
-            window.open(data.audioUrl, "_blank");
-          }, 800);
-          setError("This quality has separate video & audio tracks — both tabs opened. Merge them with a tool like FFmpeg if needed.");
+          if (audioWindow) {
+            audioWindow.location.replace(data.audioUrl);
+            setError("This quality uses separate video and audio tracks, so both downloads were opened.");
+          } else {
+            setError("The video opened, but your browser blocked its separate audio track. Allow pop-ups and try again.");
+          }
+        } else {
+          audioWindow?.close();
         }
 
         setDownloadSuccess(true);
@@ -132,6 +147,8 @@ export default function YoutubeDownloader() {
         throw new Error("No download link received.");
       }
     } catch (err: unknown) {
+      downloadWindow.close();
+      audioWindow?.close();
       const msg = err instanceof Error ? err.message : "Download failed. Please try again.";
       setError(msg);
     } finally {
@@ -154,6 +171,15 @@ export default function YoutubeDownloader() {
       <div className="relative z-10 flex flex-col min-h-screen">
         {/* Header */}
         <header className="py-6 px-4 text-center">
+          <div className="mb-5 text-center">
+            <p className="text-xs font-bold uppercase text-primary">Created and managed by SANNAN</p>
+            <a
+              href="mailto:maliksannanali12345@gmail.com"
+              className="mt-1 inline-block text-xs text-muted-foreground hover:text-primary transition-colors"
+            >
+              maliksannanali12345@gmail.com
+            </a>
+          </div>
           <div className="inline-flex items-center gap-2 mb-2">
             <div className="w-10 h-10 gradient-primary rounded-xl flex items-center justify-center shadow-lg">
               <Download className="w-5 h-5 text-primary-foreground" />
