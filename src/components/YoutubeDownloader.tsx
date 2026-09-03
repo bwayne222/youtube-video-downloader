@@ -265,12 +265,10 @@ export default function YoutubeDownloader() {
                           `https://img.youtube.com/vi/${videoInfo.videoId}/hqdefault.jpg`,
                           `https://i.ytimg.com/vi/${videoInfo.videoId}/default.jpg`,
                         ];
-                        const next = chain.find((u) => !img.src.includes(u.split("/vi/")[1]?.split("/")[1] ?? "") ? true : false);
                         const idx = chain.indexOf(img.src);
                         const fallback = idx === -1 ? chain[0] : chain[idx + 1];
                         if (fallback) img.src = fallback;
                         else img.style.display = "none";
-                        void next;
                       }}
                     />
                     <a
