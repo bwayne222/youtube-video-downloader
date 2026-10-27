@@ -142,7 +142,7 @@ function closest(list: VideoFormat[], target: number): VideoFormat | null {
   })[0];
 }
 
-function resolveDownload(videoId: string, quality: string): Resolved {
+async function resolveDownload(videoId: string, quality: string): Promise<Resolved> {
   const cacheKey = `${videoId}|${quality}`;
   const cached = formatCache.get(cacheKey);
   if (cached && cached.expires > Date.now()) {
