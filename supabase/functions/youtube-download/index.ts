@@ -151,10 +151,6 @@ function resolveDownload(videoId: string, quality: string): Resolved {
   }
 
   const isAudio = quality === 'audio';
-  let formats: VideoFormat[] | null = null;
-  try {
-    formats = Deno.env.get('RAPIDAPI_KEY') ? null : null;
-  } catch { /* noop */ }
 
   return (async () => {
     const key = Deno.env.get('RAPIDAPI_KEY');
