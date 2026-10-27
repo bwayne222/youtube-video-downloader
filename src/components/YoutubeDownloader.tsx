@@ -43,11 +43,13 @@ export default function YoutubeDownloader() {
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState("");
   const [downloadSuccess, setDownloadSuccess] = useState(false);
+  const [audioTrackUrl, setAudioTrackUrl] = useState<string | null>(null);
 
   const fetchVideoInfo = async () => {
     setError("");
     setVideoInfo(null);
     setDownloadSuccess(false);
+    setAudioTrackUrl(null);
 
     const trimmed = url.trim();
     if (!trimmed) {
@@ -81,30 +83,45 @@ export default function YoutubeDownloader() {
     }
   };
 
+  // The backend streams the file itself with a download header, so the browser
+  // saves it directly. No pop-ups or new tabs — this is what keeps the flow
+  // working reliably on phones.
+  const triggerDownload = (href: string) => {
+    const a = document.createElement("a");
+    a.href = href;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
+  const buildDownloadUrl = (info: VideoInfo, quality: string, track: "video" | "audio") => {
+    const projectId = import.meta.env.VITE_SUPABASE_PROJECT_ID;
+    const fnUrl = `https://${projectId}.supabase.co/functions/v1/youtube-download`;
+    const params = new URLSearchParams({
+      videoId: info.videoId,
+      quality,
+      dl: "1",
+      track,
+      title: info.title || "",
+    });
+    return `${fnUrl}?${params.toString()}`;
+  };
+
   const handleDownload = async () => {
     if (!videoInfo) return;
-
-    // Open the destination while this click is still a trusted user action.
-    // Browsers block window.open calls made after an awaited network request.
-    const downloadWindow = window.open("about:blank", "_blank");
-    const mayNeedSeparateAudio = selectedQuality !== "audio" && Number(selectedQuality) > 720;
-    const audioWindow = mayNeedSeparateAudio ? window.open("about:blank", "_blank") : null;
-
-    if (!downloadWindow) {
-      setError("Your browser blocked the download. Please allow pop-ups for this site and try again.");
-      audioWindow?.close();
-      return;
-    }
 
     setDownloading(true);
     setDownloadSuccess(false);
     setError("");
+    setAudioTrackUrl(null);
 
     try {
       const projectId = import.meta.env.VITE_SUPABASE_PROJECT_ID;
       const anonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
       const fnUrl = `https://${projectId}.supabase.co/functions/v1/youtube-download`;
 
+      // Resolve and validate the stream first so any error stays inside the page.
       const res = await fetch(fnUrl, {
         method: "POST",
         headers: {
@@ -118,37 +135,20 @@ export default function YoutubeDownloader() {
       });
 
       const data = await res.json();
-
       if (!res.ok || data.error) {
-        const err = data.error || "Download failed.";
-        if (data.rapidApiUrl) {
-          window.open(data.rapidApiUrl, "_blank");
-        }
-        throw new Error(err);
+        throw new Error(data.error || "Download failed. Please try again.");
       }
 
-      if (data.url) {
-        downloadWindow.location.replace(data.url);
+      triggerDownload(buildDownloadUrl(videoInfo, selectedQuality, "video"));
 
-        // YouTube serves higher resolutions as separate video and audio streams.
-        if (data.videoOnly && data.audioUrl) {
-          if (audioWindow) {
-            audioWindow.location.replace(data.audioUrl);
-            setError("This quality uses separate video and audio tracks, so both downloads were opened.");
-          } else {
-            setError("The video opened, but your browser blocked its separate audio track. Allow pop-ups and try again.");
-          }
-        } else {
-          audioWindow?.close();
-        }
-
-        setDownloadSuccess(true);
-      } else {
-        throw new Error("No download link received.");
+      // Higher resolutions are separate video and audio tracks on YouTube;
+      // offer the audio track as a second, one-tap download.
+      if (data.videoOnly && data.audioUrl) {
+        setAudioTrackUrl(buildDownloadUrl(videoInfo, selectedQuality, "audio"));
       }
+
+      setDownloadSuccess(true);
     } catch (err: unknown) {
-      downloadWindow.close();
-      audioWindow?.close();
       const msg = err instanceof Error ? err.message : "Download failed. Please try again.";
       setError(msg);
     } finally {
