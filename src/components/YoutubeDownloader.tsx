@@ -242,7 +242,7 @@ export default function YoutubeDownloader() {
               {downloadSuccess && (
                 <div className="flex items-center gap-2 text-accent bg-accent/10 rounded-xl px-4 py-3 mb-4 text-sm animate-bounce-in border border-accent/20">
                   <CheckCircle2 className="w-4 h-4 shrink-0" />
-                  <span>Download started! Check your downloads folder.</span>
+                  <span>{audioTrackUrl ? "Video download started — grab the audio track below too." : "Download started! Check your downloads folder."}</span>
                 </div>
               )}
 
@@ -337,14 +337,25 @@ export default function YoutubeDownloader() {
                     className="w-full py-4 gradient-primary text-primary-foreground font-bold rounded-2xl hover:opacity-90 active:scale-[0.98] transition-all duration-150 disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2 text-base shadow-lg"
                   >
                     {downloading ? (
-                      <><Loader2 className="w-5 h-5 animate-spin" /> Processing Download...</>
+                      <><Loader2 className="w-5 h-5 animate-spin" /> Preparing your download...</>
                     ) : (
                       <>
                         <Download className="w-5 h-5" />
-                        Download {selectedQuality === "audio" ? "Audio (MP3)" : `${selectedQuality === "2160" ? "4K" : selectedQuality + "p"} Video`}
+                        Download {selectedQuality === "audio" ? "Audio" : `${selectedQuality === "2160" ? "4K" : selectedQuality + "p"} Video`}
                       </>
                     )}
                   </button>
+
+                  {/* Separate audio track for high-res downloads */}
+                  {audioTrackUrl && (
+                    <button
+                      onClick={() => triggerDownload(audioTrackUrl)}
+                      className="w-full py-3 mt-3 border border-primary/40 text-primary font-semibold rounded-2xl hover:bg-primary/10 active:scale-[0.98] transition-all flex items-center justify-center gap-2 text-sm"
+                    >
+                      <Music className="w-4 h-4" />
+                      Download the matching audio track
+                    </button>
+                  )}
 
                   <p className="text-center text-xs text-muted-foreground mt-3">
                     For personal use only • Respect copyright laws
