@@ -43,11 +43,13 @@ export default function YoutubeDownloader() {
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState("");
   const [downloadSuccess, setDownloadSuccess] = useState(false);
+  const [audioTrackUrl, setAudioTrackUrl] = useState<string | null>(null);
 
   const fetchVideoInfo = async () => {
     setError("");
     setVideoInfo(null);
     setDownloadSuccess(false);
+    setAudioTrackUrl(null);
 
     const trimmed = url.trim();
     if (!trimmed) {
@@ -81,30 +83,45 @@ export default function YoutubeDownloader() {
     }
   };
 
+  // The backend streams the file itself with a download header, so the browser
+  // saves it directly. No pop-ups or new tabs — this is what keeps the flow
+  // working reliably on phones.
+  const triggerDownload = (href: string) => {
+    const a = document.createElement("a");
+    a.href = href;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
+  const buildDownloadUrl = (info: VideoInfo, quality: string, track: "video" | "audio") => {
+    const projectId = import.meta.env.VITE_SUPABASE_PROJECT_ID;
+    const fnUrl = `https://${projectId}.supabase.co/functions/v1/youtube-download`;
+    const params = new URLSearchParams({
+      videoId: info.videoId,
+      quality,
+      dl: "1",
+      track,
+      title: info.title || "",
+    });
+    return `${fnUrl}?${params.toString()}`;
+  };
+
   const handleDownload = async () => {
     if (!videoInfo) return;
-
-    // Open the destination while this click is still a trusted user action.
-    // Browsers block window.open calls made after an awaited network request.
-    const downloadWindow = window.open("about:blank", "_blank");
-    const mayNeedSeparateAudio = selectedQuality !== "audio" && Number(selectedQuality) > 720;
-    const audioWindow = mayNeedSeparateAudio ? window.open("about:blank", "_blank") : null;
-
-    if (!downloadWindow) {
-      setError("Your browser blocked the download. Please allow pop-ups for this site and try again.");
-      audioWindow?.close();
-      return;
-    }
 
     setDownloading(true);
     setDownloadSuccess(false);
     setError("");
+    setAudioTrackUrl(null);
 
     try {
       const projectId = import.meta.env.VITE_SUPABASE_PROJECT_ID;
       const anonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
       const fnUrl = `https://${projectId}.supabase.co/functions/v1/youtube-download`;
 
+      // Resolve and validate the stream first so any error stays inside the page.
       const res = await fetch(fnUrl, {
         method: "POST",
         headers: {
@@ -118,37 +135,20 @@ export default function YoutubeDownloader() {
       });
 
       const data = await res.json();
-
       if (!res.ok || data.error) {
-        const err = data.error || "Download failed.";
-        if (data.rapidApiUrl) {
-          window.open(data.rapidApiUrl, "_blank");
-        }
-        throw new Error(err);
+        throw new Error(data.error || "Download failed. Please try again.");
       }
 
-      if (data.url) {
-        downloadWindow.location.replace(data.url);
+      triggerDownload(buildDownloadUrl(videoInfo, selectedQuality, "video"));
 
-        // YouTube serves higher resolutions as separate video and audio streams.
-        if (data.videoOnly && data.audioUrl) {
-          if (audioWindow) {
-            audioWindow.location.replace(data.audioUrl);
-            setError("This quality uses separate video and audio tracks, so both downloads were opened.");
-          } else {
-            setError("The video opened, but your browser blocked its separate audio track. Allow pop-ups and try again.");
-          }
-        } else {
-          audioWindow?.close();
-        }
-
-        setDownloadSuccess(true);
-      } else {
-        throw new Error("No download link received.");
+      // Higher resolutions are separate video and audio tracks on YouTube;
+      // offer the audio track as a second, one-tap download.
+      if (data.videoOnly && data.audioUrl) {
+        setAudioTrackUrl(buildDownloadUrl(videoInfo, selectedQuality, "audio"));
       }
+
+      setDownloadSuccess(true);
     } catch (err: unknown) {
-      downloadWindow.close();
-      audioWindow?.close();
       const msg = err instanceof Error ? err.message : "Download failed. Please try again.";
       setError(msg);
     } finally {
@@ -242,7 +242,7 @@ export default function YoutubeDownloader() {
               {downloadSuccess && (
                 <div className="flex items-center gap-2 text-accent bg-accent/10 rounded-xl px-4 py-3 mb-4 text-sm animate-bounce-in border border-accent/20">
                   <CheckCircle2 className="w-4 h-4 shrink-0" />
-                  <span>Download started! Check your downloads folder.</span>
+                  <span>{audioTrackUrl ? "Video download started — grab the audio track below too." : "Download started! Check your downloads folder."}</span>
                 </div>
               )}
 
@@ -337,14 +337,25 @@ export default function YoutubeDownloader() {
                     className="w-full py-4 gradient-primary text-primary-foreground font-bold rounded-2xl hover:opacity-90 active:scale-[0.98] transition-all duration-150 disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2 text-base shadow-lg"
                   >
                     {downloading ? (
-                      <><Loader2 className="w-5 h-5 animate-spin" /> Processing Download...</>
+                      <><Loader2 className="w-5 h-5 animate-spin" /> Preparing your download...</>
                     ) : (
                       <>
                         <Download className="w-5 h-5" />
-                        Download {selectedQuality === "audio" ? "Audio (MP3)" : `${selectedQuality === "2160" ? "4K" : selectedQuality + "p"} Video`}
+                        Download {selectedQuality === "audio" ? "Audio" : `${selectedQuality === "2160" ? "4K" : selectedQuality + "p"} Video`}
                       </>
                     )}
                   </button>
+
+                  {/* Separate audio track for high-res downloads */}
+                  {audioTrackUrl && (
+                    <button
+                      onClick={() => triggerDownload(audioTrackUrl)}
+                      className="w-full py-3 mt-3 border border-primary/40 text-primary font-semibold rounded-2xl hover:bg-primary/10 active:scale-[0.98] transition-all flex items-center justify-center gap-2 text-sm"
+                    >
+                      <Music className="w-4 h-4" />
+                      Download the matching audio track
+                    </button>
+                  )}
 
                   <p className="text-center text-xs text-muted-foreground mt-3">
                     For personal use only • Respect copyright laws
