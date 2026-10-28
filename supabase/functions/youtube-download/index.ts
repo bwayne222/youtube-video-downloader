@@ -175,18 +175,42 @@ async function resolveDownload(videoId: string, quality: string): Promise<Resolv
         } else {
           const targetHeight = parseInt(quality) || 720;
           const videoFormats = fmts.filter(f => f.mimeType?.startsWith('video/'));
+          const heightOf = (f: VideoFormat) => f.height || parseInt(f.qualityLabel || '0') || 0;
           const combined = videoFormats.filter(f => hasAudioTrack(f));
           const videoOnly = videoFormats.filter(f => !hasAudioTrack(f));
+          const audioStreams = fmts.filter(f => f.mimeType?.startsWith('audio/')).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
-          let chosen = closest(combined, targetHeight);
+          // Prefer a stream that actually reaches the requested quality:
+          // 1. a combined (video+audio) stream at or above the target,
+          // 2. else a video-only stream at or above it (audio offered separately),
+          // 3. else the highest-quality stream available.
+          const firstAtOrAbove = (list: VideoFormat[]) =>
+            list.slice().sort((a, b) => heightOf(a) - heightOf(b))[0];
+          const combinedUp = firstAtOrAbove(combined.filter(f => heightOf(f) >= targetHeight));
+          const videoOnlyUp = firstAtOrAbove(videoOnly.filter(f => heightOf(f) >= targetHeight));
+
+          let chosen: VideoFormat | undefined;
           let isVideoOnly = false;
-          if (!chosen) { chosen = closest(videoOnly, targetHeight); isVideoOnly = true; }
+          if (combinedUp) {
+            chosen = combinedUp;
+          } else if (videoOnlyUp) {
+            chosen = videoOnlyUp;
+            isVideoOnly = true;
+          } else {
+            const bestCombined = combined.slice().sort((a, b) => heightOf(b) - heightOf(a))[0];
+            const bestVideoOnly = videoOnly.slice().sort((a, b) => heightOf(b) - heightOf(a))[0];
+            if (bestVideoOnly && heightOf(bestVideoOnly) >= heightOf(bestCombined || { height: 0 } as VideoFormat)) {
+              chosen = bestVideoOnly;
+              isVideoOnly = true;
+            } else {
+              chosen = bestCombined || bestVideoOnly;
+            }
+          }
 
           if (chosen?.url) {
             let audioUrl: string | undefined;
             let audioMime: string | undefined;
             if (isVideoOnly) {
-              const audioStreams = fmts.filter(f => f.mimeType?.startsWith('audio/')).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
               audioUrl = audioStreams[0]?.url;
               audioMime = audioStreams[0]?.mimeType;
             }
