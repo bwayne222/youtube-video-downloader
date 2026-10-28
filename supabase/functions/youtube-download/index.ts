@@ -133,15 +133,6 @@ function hasAudioTrack(f: VideoFormat): boolean {
   return false;
 }
 
-function closest(list: VideoFormat[], target: number): VideoFormat | null {
-  if (!list.length) return null;
-  return list.sort((a, b) => {
-    const ah = a.height || parseInt(a.qualityLabel || '0');
-    const bh = b.height || parseInt(b.qualityLabel || '0');
-    return Math.abs(ah - target) - Math.abs(bh - target);
-  })[0];
-}
-
 async function resolveDownload(videoId: string, quality: string): Promise<Resolved> {
   const cacheKey = `${videoId}|${quality}`;
   const cached = formatCache.get(cacheKey);
