@@ -31,98 +31,75 @@ interface Resolved {
   error?: string;
 }
 
-// In-memory cache so the browser's validation call and the file download
-// that follows reuse a single upstream lookup instead of paying for two.
-const formatCache = new Map<string, { resolved: Resolved; expires: number }>();
-const CACHE_TTL_MS = 10 * 60 * 1000;
-
-async function tryApi(
-  label: string,
-  url: string,
-  host: string,
-  apiKey: string,
-  normalize: (data: unknown) => VideoFormat[] | null
-): Promise<VideoFormat[] | null> {
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'X-RapidAPI-Key': apiKey,
-        'X-RapidAPI-Host': host,
-      },
-      signal: AbortSignal.timeout(20000),
-    });
-
-    console.log(`${label}: HTTP ${res.status}`);
-
-    if (res.status === 403 || res.status === 429) {
-      console.log(`${label}: Not subscribed or rate limited, skipping`);
-      return null;
-    }
-    if (!res.ok) {
-      const txt = await res.text();
-      console.log(`${label}: Error — ${txt.slice(0, 200)}`);
-      return null;
-    }
-
-    const data = await res.json();
-    console.log(`${label}: Got response, keys: ${Object.keys(data).join(', ')}`);
-    return normalize(data);
-  } catch (e) {
-    console.log(`${label}: Exception — ${e}`);
-    return null;
-  }
+interface Provider {
+  label: string;
+  buildUrl: (videoId: string) => string;
+  host: string;
+  normalize: (data: unknown) => VideoFormat[] | null;
 }
 
-async function fetchFormats(videoId: string): Promise<VideoFormat[] | null> {
-  const apiKey = Deno.env.get('RAPIDAPI_KEY');
-  if (!apiKey) return null;
-
-  let formats = await tryApi(
-    'yt-api',
-    `https://yt-api.p.rapidapi.com/dl?id=${videoId}`,
-    'yt-api.p.rapidapi.com',
-    apiKey,
-    (data: unknown) => {
+const PROVIDERS: Provider[] = [
+  {
+    label: 'yt-api',
+    buildUrl: (id) => `https://yt-api.p.rapidapi.com/dl?id=${id}`,
+    host: 'yt-api.p.rapidapi.com',
+    normalize: (data: unknown) => {
       const d = data as { formats?: VideoFormat[]; adaptiveFormats?: VideoFormat[] };
       const all = [...(d.formats || []), ...(d.adaptiveFormats || [])];
       return all.length > 0 ? all : null;
-    }
-  );
+    },
+  },
+  {
+    label: 'ytstream',
+    buildUrl: (id) => `https://ytstream-download-youtube-videos.p.rapidapi.com/dl?id=${id}`,
+    host: 'ytstream-download-youtube-videos.p.rapidapi.com',
+    normalize: (data: unknown) => {
+      const d = data as { formats?: VideoFormat[]; adaptiveFormats?: VideoFormat[] };
+      const all = [...(d.formats || []), ...(d.adaptiveFormats || [])];
+      return all.length > 0 ? all : null;
+    },
+  },
+  {
+    label: 'yt-video-info',
+    buildUrl: (id) => `https://youtube-video-download-info.p.rapidapi.com/dl?id=${id}`,
+    host: 'youtube-video-download-info.p.rapidapi.com',
+    normalize: (data: unknown) => {
+      const d = data as { status?: string; link?: Array<Array<{ url?: string; type?: string; quality?: string }>> };
+      if (d.status !== 'ok' || !Array.isArray(d.link)) return null;
+      const flat = d.link.flat().map((l) => ({
+        url: l.url || '',
+        qualityLabel: l.quality,
+        mimeType: l.type,
+      })).filter(f => f.url);
+      return flat.length > 0 ? flat : null;
+    },
+  },
+];
 
-  if (!formats) {
-    formats = await tryApi(
-      'ytstream',
-      `https://ytstream-download-youtube-videos.p.rapidapi.com/dl?id=${videoId}`,
-      'ytstream-download-youtube-videos.p.rapidapi.com',
-      apiKey,
-      (data: unknown) => {
-        const d = data as { formats?: VideoFormat[]; adaptiveFormats?: VideoFormat[] };
-        const all = [...(d.formats || []), ...(d.adaptiveFormats || [])];
-        return all.length > 0 ? all : null;
-      }
-    );
+// Per-provider cache of resolved streams. Each provider binds its links to a
+// different egress IP, so a link that one provider locked may still be served
+// by another. The provider whose links actually stream is remembered and
+// tried first next time.
+const formatCache = new Map<string, { resolved: Resolved; expires: number }>();
+const CACHE_TTL_MS = 10 * 60 * 1000;
+let preferredProvider = 0;
+
+async function fetchFromProvider(provider: Provider, videoId: string): Promise<VideoFormat[] | null> {
+  const apiKey = Deno.env.get('RAPIDAPI_KEY');
+  if (!apiKey) return null;
+  try {
+    const res = await fetch(provider.buildUrl(videoId), {
+      headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': provider.host },
+      signal: AbortSignal.timeout(20000),
+    });
+    console.log(`${provider.label}: HTTP ${res.status}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return provider.normalize(data);
+  } catch (e) {
+    console.log(`${provider.label}: Exception — ${e}`);
+    return null;
   }
-
-  if (!formats) {
-    formats = await tryApi(
-      'yt-video-info',
-      `https://youtube-video-download-info.p.rapidapi.com/dl?id=${videoId}`,
-      'youtube-video-download-info.p.rapidapi.com',
-      apiKey,
-      (data: unknown) => {
-        const d = data as { status?: string; link?: Array<Array<{ url?: string; type?: string; quality?: string }>> };
-        if (d.status !== 'ok' || !Array.isArray(d.link)) return null;
-        const flat = d.link.flat().map((l) => ({
-          url: l.url || '',
-          qualityLabel: l.quality,
-          mimeType: l.type,
-        })).filter(f => f.url);
-        return flat.length > 0 ? flat : null;
-      }
-    );
-  }
-
-  return formats;
 }
 
 function hasAudioTrack(f: VideoFormat): boolean {
@@ -133,96 +110,85 @@ function hasAudioTrack(f: VideoFormat): boolean {
   return false;
 }
 
-async function resolveDownload(videoId: string, quality: string): Promise<Resolved> {
-  const cacheKey = `${videoId}|${quality}`;
+function pickStream(fmts: VideoFormat[], quality: string): Picked | null {
+  if (quality === 'audio') {
+    const audioOnly = fmts.filter(f => f.mimeType?.startsWith('audio/')).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    const combined = fmts.filter(f => f.mimeType?.startsWith('video/') && hasAudioTrack(f)).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    const best = audioOnly[0] || combined[0];
+    if (!best?.url) return null;
+    return { url: best.url, mimeType: best.mimeType || 'audio/mp4', label: 'Audio', videoOnly: false };
+  }
+
+  const targetHeight = parseInt(quality) || 720;
+  const videoFormats = fmts.filter(f => f.mimeType?.startsWith('video/'));
+  const heightOf = (f: VideoFormat) => f.height || parseInt(f.qualityLabel || '0') || 0;
+  const combined = videoFormats.filter(f => hasAudioTrack(f));
+  const videoOnly = videoFormats.filter(f => !hasAudioTrack(f));
+  const audioStreams = fmts.filter(f => f.mimeType?.startsWith('audio/')).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+  // Prefer a stream that actually reaches the requested quality:
+  // 1. a combined (video+audio) stream at or above the target,
+  // 2. else a video-only stream at or above it (audio offered separately),
+  // 3. else the highest-quality stream available.
+  const firstAtOrAbove = (list: VideoFormat[]) =>
+    list.slice().sort((a, b) => heightOf(a) - heightOf(b))[0];
+  const combinedUp = firstAtOrAbove(combined.filter(f => heightOf(f) >= targetHeight));
+  const videoOnlyUp = firstAtOrAbove(videoOnly.filter(f => heightOf(f) >= targetHeight));
+
+  let chosen: VideoFormat | undefined;
+  let isVideoOnly = false;
+  if (combinedUp) {
+    chosen = combinedUp;
+  } else if (videoOnlyUp) {
+    chosen = videoOnlyUp;
+    isVideoOnly = true;
+  } else {
+    const bestCombined = combined.slice().sort((a, b) => heightOf(b) - heightOf(a))[0];
+    const bestVideoOnly = videoOnly.slice().sort((a, b) => heightOf(b) - heightOf(a))[0];
+    if (bestVideoOnly && heightOf(bestVideoOnly) >= heightOf(bestCombined || { height: 0 } as VideoFormat)) {
+      chosen = bestVideoOnly;
+      isVideoOnly = true;
+    } else {
+      chosen = bestCombined || bestVideoOnly;
+    }
+  }
+
+  if (!chosen?.url) return null;
+  return {
+    url: chosen.url,
+    mimeType: chosen.mimeType || 'video/mp4',
+    label: chosen.qualityLabel || chosen.quality || `${quality}p`,
+    videoOnly: isVideoOnly,
+    audioUrl: isVideoOnly ? audioStreams[0]?.url : undefined,
+    audioMime: isVideoOnly ? audioStreams[0]?.mimeType : undefined,
+  };
+}
+
+async function resolveFromProvider(providerIdx: number, videoId: string, quality: string): Promise<Resolved> {
+  const cacheKey = `${videoId}|${quality}|${providerIdx}`;
   const cached = formatCache.get(cacheKey);
   if (cached && cached.expires > Date.now()) {
-    console.log('cache hit');
+    console.log(`cache hit (${PROVIDERS[providerIdx].label})`);
     return cached.resolved;
   }
 
-  const isAudio = quality === 'audio';
+  const fmts = await fetchFromProvider(PROVIDERS[providerIdx], videoId);
+  let resolved: Resolved;
+  if (!fmts || fmts.length === 0) {
+    resolved = { picked: null, error: 'No formats returned.' };
+  } else {
+    console.log(`${PROVIDERS[providerIdx].label}: Total formats ${fmts.length}`);
+    const picked = pickStream(fmts, quality);
+    resolved = picked ? { picked } : { picked: null, error: 'No suitable stream found.' };
+  }
+  formatCache.set(cacheKey, { resolved, expires: Date.now() + CACHE_TTL_MS });
+  return resolved;
+}
 
-  return (async () => {
-    const key = Deno.env.get('RAPIDAPI_KEY');
-    let resolved: Resolved;
-    if (!key) {
-      resolved = { picked: null, error: 'Service not configured.' };
-    } else {
-      const fmts = await fetchFormats(videoId);
-      if (!fmts || fmts.length === 0) {
-        resolved = { picked: null, error: 'Download service is busy right now. Please try again in a few minutes.' };
-      } else {
-        console.log(`Total formats: ${fmts.length}`);
-        let picked: Picked | null = null;
-
-        if (isAudio) {
-          const audioOnly = fmts.filter(f => f.mimeType?.startsWith('audio/')).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-          const combined = fmts.filter(f => f.mimeType?.startsWith('video/') && hasAudioTrack(f)).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-          const best = audioOnly[0] || combined[0];
-          if (best?.url) {
-            picked = { url: best.url, mimeType: best.mimeType || 'audio/mp4', label: 'Audio', videoOnly: false };
-          }
-        } else {
-          const targetHeight = parseInt(quality) || 720;
-          const videoFormats = fmts.filter(f => f.mimeType?.startsWith('video/'));
-          const heightOf = (f: VideoFormat) => f.height || parseInt(f.qualityLabel || '0') || 0;
-          const combined = videoFormats.filter(f => hasAudioTrack(f));
-          const videoOnly = videoFormats.filter(f => !hasAudioTrack(f));
-          const audioStreams = fmts.filter(f => f.mimeType?.startsWith('audio/')).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-          // Prefer a stream that actually reaches the requested quality:
-          // 1. a combined (video+audio) stream at or above the target,
-          // 2. else a video-only stream at or above it (audio offered separately),
-          // 3. else the highest-quality stream available.
-          const firstAtOrAbove = (list: VideoFormat[]) =>
-            list.slice().sort((a, b) => heightOf(a) - heightOf(b))[0];
-          const combinedUp = firstAtOrAbove(combined.filter(f => heightOf(f) >= targetHeight));
-          const videoOnlyUp = firstAtOrAbove(videoOnly.filter(f => heightOf(f) >= targetHeight));
-
-          let chosen: VideoFormat | undefined;
-          let isVideoOnly = false;
-          if (combinedUp) {
-            chosen = combinedUp;
-          } else if (videoOnlyUp) {
-            chosen = videoOnlyUp;
-            isVideoOnly = true;
-          } else {
-            const bestCombined = combined.slice().sort((a, b) => heightOf(b) - heightOf(a))[0];
-            const bestVideoOnly = videoOnly.slice().sort((a, b) => heightOf(b) - heightOf(a))[0];
-            if (bestVideoOnly && heightOf(bestVideoOnly) >= heightOf(bestCombined || { height: 0 } as VideoFormat)) {
-              chosen = bestVideoOnly;
-              isVideoOnly = true;
-            } else {
-              chosen = bestCombined || bestVideoOnly;
-            }
-          }
-
-          if (chosen?.url) {
-            let audioUrl: string | undefined;
-            let audioMime: string | undefined;
-            if (isVideoOnly) {
-              audioUrl = audioStreams[0]?.url;
-              audioMime = audioStreams[0]?.mimeType;
-            }
-            picked = {
-              url: chosen.url,
-              mimeType: chosen.mimeType || 'video/mp4',
-              label: chosen.qualityLabel || chosen.quality || `${quality}p`,
-              videoOnly: isVideoOnly,
-              audioUrl,
-              audioMime,
-            };
-          }
-        }
-
-        resolved = picked ? { picked } : { picked: null, error: 'No suitable stream found for this video.' };
-      }
-    }
-
-    formatCache.set(cacheKey, { resolved, expires: Date.now() + CACHE_TTL_MS });
-    return resolved;
-  })();
+function pickStreamFor(quality: string, r: Resolved): { streamUrl: string; mime: string } | null {
+  if (!r.picked) return null;
+  const useAudio = quality === 'audio' || r.picked.audioUrl !== undefined && false;
+  return { streamUrl: r.picked.url, mime: r.picked.mimeType };
 }
 
 function extFromMime(mime: string): string {
@@ -251,32 +217,66 @@ function json(body: unknown, status = 200) {
   });
 }
 
-async function proxyStream(streamUrl: string, filename: string, upstreamMime: string, range: string | null) {
-  const headers: Record<string, string> = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-    'Referer': 'https://www.youtube.com/',
-  };
-  if (range) headers['Range'] = range;
+// Stream the file to the browser with a download header, trying every
+// provider until one delivers. Returns null only if all providers failed.
+async function deliver(
+  videoId: string,
+  quality: string,
+  track: string,
+  title: string,
+  range: string | null
+): Promise<Response | null> {
+  const useAudio = track === 'audio' || quality === 'audio';
 
-  const upstream = await fetch(streamUrl, { headers, redirect: 'follow' });
-  console.log(`proxy: upstream HTTP ${upstream.status}`);
-  if (!upstream.ok && upstream.status !== 206) {
-    return json({ error: 'Could not fetch the file. Please try again.' }, 502);
+  for (let i = 0; i < PROVIDERS.length; i++) {
+    const idx = (preferredProvider + i) % PROVIDERS.length;
+    const resolved = await resolveFromProvider(idx, videoId, quality);
+    if (!resolved.picked) continue;
+
+    const { picked } = resolved;
+    const streamUrl = useAudio && quality !== 'audio' ? (picked.audioUrl || picked.url) : picked.url;
+    const mime = useAudio && quality !== 'audio' ? (picked.audioMime || 'audio/mp4') : picked.mimeType;
+    const suffix = quality === 'audio' || track === 'audio' ? 'Audio' : picked.label;
+    const filename = safeFilename(title, suffix, mime);
+
+    const headers: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Referer': 'https://www.youtube.com/',
+    };
+    if (range) headers['Range'] = range;
+
+    let upstream: Response;
+    try {
+      upstream = await fetch(streamUrl, { headers, redirect: 'follow' });
+    } catch (e) {
+      console.log(`${PROVIDERS[idx].label}: stream fetch exception — ${e}`);
+      formatCache.delete(`${videoId}|${quality}|${idx}`);
+      continue;
+    }
+    console.log(`${PROVIDERS[idx].label}: upstream HTTP ${upstream.status}`);
+
+    if (upstream.ok || upstream.status === 206) {
+      preferredProvider = idx;
+      const outHeaders: Record<string, string> = {
+        ...corsHeaders,
+        'Content-Type': mime,
+        'Content-Disposition': `attachment; filename="${filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '')}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        'Cache-Control': 'no-store',
+        'Accept-Ranges': 'bytes',
+      };
+      const len = upstream.headers.get('content-length');
+      if (len) outHeaders['Content-Length'] = len;
+      const cr = upstream.headers.get('content-range');
+      if (cr) outHeaders['Content-Range'] = cr;
+      return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
+    }
+
+    // This provider's link is not fetchable — drop it from cache and try the next.
+    await upstream.body?.cancel();
+    formatCache.delete(`${videoId}|${quality}|${idx}`);
   }
 
-  const outHeaders: Record<string, string> = {
-    ...corsHeaders,
-    'Content-Type': upstreamMime,
-    'Content-Disposition': `attachment; filename="${filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '')}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
-    'Cache-Control': 'no-store',
-    'Accept-Ranges': 'bytes',
-  };
-  const len = upstream.headers.get('content-length');
-  if (len) outHeaders['Content-Length'] = len;
-  const cr = upstream.headers.get('content-range');
-  if (cr) outHeaders['Content-Range'] = cr;
-
-  return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
+  return null;
 }
 
 serve(async (req) => {
@@ -285,48 +285,57 @@ serve(async (req) => {
   }
 
   try {
-    // ── GET: browser navigates here to receive the actual file ───────────
+    const url = new URL(req.url);
+
+    // ── GET: the browser navigates here to receive the actual file ───────
     if (req.method === 'GET') {
-      const p = new URL(req.url).searchParams;
-      const videoId = p.get('videoId');
-      const quality = p.get('quality') || '720';
-      const dl = p.get('dl') === '1';
-      const title = p.get('title') || '';
+      const videoId = url.searchParams.get('videoId');
+      const quality = url.searchParams.get('quality') || '720';
+      const dl = url.searchParams.get('dl') === '1';
+      const title = url.searchParams.get('title') || '';
 
       if (!videoId) return json({ error: 'videoId is required' }, 400);
 
-      const resolved = await resolveDownload(videoId, quality);
-      if (!resolved.picked) return json({ error: resolved.error || 'Could not resolve video.' }, 502);
-
-      const { picked } = resolved;
-      const track = p.get('track') || 'video';
-      const useAudio = track === 'audio' || quality === 'audio';
-      const streamUrl = useAudio && picked.audioUrl ? picked.audioUrl : picked.url;
-      const mime = useAudio && picked.audioUrl ? (picked.audioMime || 'audio/mp4') : picked.mimeType;
-      const suffix = quality === 'audio' ? 'Audio' : `${picked.label}`;
-      const filename = safeFilename(title, suffix, mime);
-
       if (!dl) {
+        const resolved = await resolveFromProvider(preferredProvider, videoId, quality);
+        if (!resolved.picked) return json({ error: resolved.error || 'Could not resolve video.' }, 502);
+        const { picked } = resolved;
+        const suffix = quality === 'audio' ? 'Audio' : picked.label;
         return json({
-          url: picked.url,
           quality: picked.label,
           mimeType: picked.mimeType,
           videoOnly: picked.videoOnly,
           audioUrl: picked.audioUrl,
-          filename,
+          filename: safeFilename(title, suffix, picked.mimeType),
           type: quality === 'audio' ? 'audio' : 'video',
         });
       }
 
-      return await proxyStream(streamUrl, filename, mime, req.headers.get('range'));
+      const resp = await deliver(
+        videoId,
+        quality,
+        url.searchParams.get('track') || 'video',
+        title,
+        req.headers.get('range')
+      );
+      if (resp) return resp;
+      return json({ error: 'The file could not be fetched right now. Please try again in a moment.' }, 502);
     }
 
     // ── POST: validation + metadata for the UI ───────────────────────────
     const { videoId, quality } = await req.json();
     if (!videoId) return json({ error: 'videoId is required' }, 400);
 
-    const resolved = await resolveDownload(videoId, quality || '720');
-    if (!resolved.picked) return json({ error: resolved.error || 'Could not resolve video.' }, 502);
+    let resolved: Resolved | null = null;
+    for (let i = 0; i < PROVIDERS.length && !resolved?.picked; i++) {
+      const idx = (preferredProvider + i) % PROVIDERS.length;
+      const r = await resolveFromProvider(idx, videoId, quality || '720');
+      if (r.picked) {
+        preferredProvider = idx;
+        resolved = r;
+      }
+    }
+    if (!resolved?.picked) return json({ error: 'Could not resolve video.' }, 502);
 
     const { picked } = resolved;
     return json({
@@ -334,7 +343,6 @@ serve(async (req) => {
       mimeType: picked.mimeType,
       videoOnly: picked.videoOnly,
       audioUrl: picked.audioUrl,
-      filename: safeFilename('', picked.videoOnly ? picked.label : picked.label, picked.mimeType),
       type: quality === 'audio' ? 'audio' : 'video',
     });
   } catch (err) {
