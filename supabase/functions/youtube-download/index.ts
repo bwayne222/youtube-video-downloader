@@ -185,12 +185,6 @@ async function resolveFromProvider(providerIdx: number, videoId: string, quality
   return resolved;
 }
 
-function pickStreamFor(quality: string, r: Resolved): { streamUrl: string; mime: string } | null {
-  if (!r.picked) return null;
-  const useAudio = quality === 'audio' || r.picked.audioUrl !== undefined && false;
-  return { streamUrl: r.picked.url, mime: r.picked.mimeType };
-}
-
 function extFromMime(mime: string): string {
   if (mime.startsWith('audio/')) {
     if (mime.includes('mpeg')) return 'mp3';
@@ -326,16 +320,16 @@ serve(async (req) => {
     const { videoId, quality } = await req.json();
     if (!videoId) return json({ error: 'videoId is required' }, 400);
 
-    let resolved: Resolved | null = null;
-    for (let i = 0; i < PROVIDERS.length && !resolved?.picked; i++) {
-      const idx = (preferredProvider + i) % PROVIDERS.length;
-      const r = await resolveFromProvider(idx, videoId, quality || '720');
-      if (r.picked) {
-        preferredProvider = idx;
-        resolved = r;
-      }
+    // Verify the file is actually fetchable (first byte) before the browser
+    // is sent to download it, so failures stay inside the app.
+    const probe = await deliver(videoId, quality || '720', 'video', '', 'bytes=0-0');
+    if (!probe) {
+      return json({ error: 'This video is temporarily unavailable for download. Please try another quality or try again in a few minutes.' }, 502);
     }
-    if (!resolved?.picked) return json({ error: 'Could not resolve video.' }, 502);
+    await probe.body?.cancel();
+
+    const resolved = await resolveFromProvider(preferredProvider, videoId, quality || '720');
+    if (!resolved.picked) return json({ error: 'Could not resolve video.' }, 502);
 
     const { picked } = resolved;
     return json({
